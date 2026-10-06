@@ -317,7 +317,7 @@ input,select,textarea{max-width:100%}
     10. Démarrage
    ========================================================================== */
 'use strict';
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1';
 const SCHEMA_VERSION = 4;
 const STORAGE_KEY = 'coachCourse';
 
@@ -850,9 +850,9 @@ const Plan = {
 
     /* --- Sortie longue --- */
     const lp = { base:0.32, developpement:0.33, specifique:(race && race.distanceKm>=40 ? 0.42 : 0.35), affutage:0.3, recuperation:0.3 }[info.phase] + (n<=4 ? 0.05 : 0);
-    // Double préparation : si une course plus longue suit ce bloc, la sortie longue reste développée pour elle (hors affûtage)
+    // Double préparation : si une course plus longue suit ce bloc à moins de 20 semaines, la sortie longue travaille déjà pour elle (hors affûtage et semaine de course)
     const nextR = info.nextRace;
-    const prepNext = !!(nextR && race && ['base','developpement'].includes(info.phase) && nextR.distanceKm > race.distanceKm);
+    const prepNext = !!(nextR && race && ['base','developpement','specifique'].includes(info.phase) && nextR.distanceKm > race.distanceKm && Util.daysBetween(monday, Util.parse(nextR.date)) <= 140);
     const capFor = km => km==null ? 22 : km<=10 ? 16 : km<=21.1 ? 22 : km<=42.2 ? 34 : 36;
     const cap = Math.max(capFor(race ? race.distanceKm : null), prepNext ? capFor(nextR.distanceKm) : 0);
     let longKm = Util.clamp(Math.round(vol*lp), 8, cap);
@@ -923,6 +923,11 @@ const Plan = {
       days.forEach(d => { for(const slot of ['run','strength']){ const src = mv[`${d.date}:${slot==='run'?'run':'renfo'}`]; if(src && gen[src]){ d[slot] = gen[src][slot]; if(d[slot] && src!==d.date) d[slot].movedFrom = src; } } }); }
     const ov = st.plan.overrides || {};
     days.forEach(d => { const o = ov[`${d.date}:run`]; if(o && o.kind==='replace'){ d.run = Plan.customSession(o, z, idx, race, info.phase); } });
+
+    /* --- Attribution : chaque séance (course et renfo) indique la course qu'elle prépare.
+       Pendant la double préparation, la sortie longue travaille déjà pour la course suivante. --- */
+    days.forEach(d => { if(d.run && d.run.kind!=='X' && d.run.kind!=='RACE') d.run.forRace = (d.run.kind==='L' && prepNext) ? nextR : race;
+      if(d.strength) d.strength.forRace = race; });
 
     /* --- Avis d'ajustement --- */
     if(mode==='skipped') notices.push('Séance sautée : on ne rattrape jamais une séance de qualité. Le reste de la semaine reste en place, +1 km sur les endurances si les jambes sont bonnes.');
@@ -1081,7 +1086,8 @@ const UI = {
     return `<div class="steps">${s.steps.map(st => st.reps
       ? `<div class="step"><span class="n"></span><div class="b"><b>Répéter ${st.reps} × — ${Util.esc(st.label)}</b><div class="sub">${st.parts.map((pt,i)=>`<div>${String.fromCharCode(97+i)}) <b>${UI.qty(pt)}</b> ${Util.esc(pt.label)} <span class="muted">· ${UI.target(pt,z)}</span>${how(pt)}</div>`).join('')}</div></div></div>`
       : `<div class="step"><span class="n"></span><div class="b"><b>${UI.qty(st)} · ${Util.esc(st.label)}</b><div class="tg">${UI.target(st,z)}</div>${how(st)}</div></div>`).join('')}</div>`; },
-  sessRow(d, s, slot){ if(!s) return ''; const status = slot==='run' ? d.statusRun : d.statusRenfo; const meta = slot==='run' ? (s.kind==='X' ? s.intent.slice(0,60) : `${s.km ? Util.km(s.km)+' km · ' : ''}${Util.fmtDur(s.min)}`) : `${Util.fmtDur(s.min)} · ${Data.state.profile.gymPref}`;
+  raceTag(s){ if(!s || !s.forRace) return ''; const n = s.forRace.name; return ` · ${n.length>22 ? n.slice(0,21)+'…' : n}`; },
+  sessRow(d, s, slot){ if(!s) return ''; const status = slot==='run' ? d.statusRun : d.statusRenfo; const meta = slot==='run' ? (s.kind==='X' ? s.intent.slice(0,60) : `${s.km ? Util.km(s.km)+' km · ' : ''}${Util.fmtDur(s.min)}${UI.raceTag(s)}`) : `${Util.fmtDur(s.min)} · ${Data.state.profile.gymPref}${UI.raceTag(s)}`;
     const stLabel = {done:'Fait',modified:'Modifiée',skipped:'Sautée'}[status];
     return `<button class="sess ${status||''} ${s.kind==='RACE'?'':'drag'}" data-date="${d.date}" data-slot="${slot}" style="width:100%;text-align:left" onclick="UI.open${slot==='run'?'Session':'Strength'}('${d.date}')"><i class="sw ${s.zone==='AC'?'M':s.zone}"></i><div class="t"><b>${Util.esc(s.title)}</b><span>${Util.esc(meta)}</span></div>${stLabel?`<span class="st ${status}">${stLabel}</span>`:''}${s.kind!=='RACE'?`<span class="grip" data-date="${d.date}" data-slot="${slot}" role="button" aria-label="Déplacer vers un autre jour"><svg viewBox="0 0 14 20"><circle cx="4" cy="4" r="1.8"/><circle cx="10" cy="4" r="1.8"/><circle cx="4" cy="10" r="1.8"/><circle cx="10" cy="10" r="1.8"/><circle cx="4" cy="16" r="1.8"/><circle cx="10" cy="16" r="1.8"/></svg></span>`:''}</button>`; },
   extraRow(d){ if(!d.extra) return ''; const x = Strength.extras[d.extra]; return `<div class="sess" style="opacity:.8"><i class="sw S"></i><div class="t"><b>${x.title}</b><span>${x.items.join(' · ')}</span></div></div>`; },
@@ -1202,6 +1208,7 @@ Object.assign(UI, {
     const btn = (v,l) => `<button class="btn sm ${st===v?'primary':''}" onclick="UI.mark('${key}','${v}','${date}')">${l}</button>`;
     const ov = (Data.state.plan.overrides||{})[key];
     UI.sheet(`<div class="muted small">${Util.fmtDateLong(date)}${s.custom?' · séance modifiée':s.movedFrom?' · déplacée du '+Util.fmtDate(s.movedFrom):''}</div><h2>${Util.esc(s.title)}</h2>
+      ${s.forRace?`<div class="small" style="margin-top:4px">Prépare : <b>${Util.esc(s.forRace.name)}</b> <span class="muted">(${Util.fmtDate(s.forRace.date, true)})</span></div>`:''}
       ${UI.ribbon(s,z)}<div class="row small" style="gap:14px"><b>${s.km?Util.km(s.km)+' km':''}</b><b>${Util.fmtDur(s.min)}</b>${s.zone&&s.zone!=='X'&&s.zone!=='AC'?`<span class="pill z ${s.zone}">${Physio.zoneName[s.zone]}</span>`:''}</div>
       <p style="margin:12px 0">${Util.esc(s.intent)}</p>
       ${UI.steps(s,z)}
@@ -1232,7 +1239,8 @@ Object.assign(UI, {
   openStrength(date){ const { day } = Plan.forDate(date); const s = day.strength; if(!s) return; const key = `${date}:renfo`; const st = day.statusRenfo; UI._alt = false;
     const render = () => { const ex = UI._alt && s.alt ? s.alt : s.exercises;
       const pr = UI._alt && s.alt ? (s.pref==='maison'?'salle':'maison') : (s.pref||'maison');
-      UI.sheet(`<div class="muted small">${Util.fmtDateLong(date)} · ${Util.fmtDur(s.min)}${s.movedFrom?' · déplacé du '+Util.fmtDate(s.movedFrom):''}</div><h2>${Util.esc(s.title)}</h2><p>${Util.esc(s.intent)}</p>
+      UI.sheet(`<div class="muted small">${Util.fmtDateLong(date)} · ${Util.fmtDur(s.min)}${s.movedFrom?' · déplacé du '+Util.fmtDate(s.movedFrom):''}</div><h2>${Util.esc(s.title)}</h2>
+      ${s.forRace?`<div class="small" style="margin:4px 0 8px">Prépare : <b>${Util.esc(s.forRace.name)}</b> <span class="muted">(${Util.fmtDate(s.forRace.date, true)})</span></div>`:''}<p>${Util.esc(s.intent)}</p>
       <div style="margin:12px 0">${ex.map((e,i)=>`<div class="ex"><span class="pic">${Strength.pics[e[3]]||Strength.pics.squat}</span><div class="b"><b>${e[0]}</b><div class="tg">${e[1]}${e[2]&&e[2]!=='—'?' · tempo '+e[2]:''}</div>${e[4]?`<div class="how">${e[4]}</div>`:''}<div class="exlinks">${s.blockIdx!=null?`<a href="${Strength.PDF}#page=${Strength.pdfPage(s.blockIdx, pr, i)}" target="_blank" rel="noopener">Fiche PDF (p. ${Strength.pdfPage(s.blockIdx, pr, i)})</a>`:''}${e[5]?`<a href="https://www.youtube.com/results?search_query=${encodeURIComponent(e[5]+' exercice')}" target="_blank" rel="noopener">▶ Vidéo</a>`:''}</div></div></div>`).join('')}</div>
       <a class="btn sm" style="text-decoration:none" href="${Strength.PDF}" target="_blank" rel="noopener">Guide PDF complet des exercices</a>
       ${s.alt?`<button class="btn sm" onclick="UI._alt=!UI._alt;UI._renderStrength()">${UI._alt?'Revenir à ma version':s.altLabel}</button>`:''}
