@@ -317,7 +317,7 @@ input,select,textarea{max-width:100%}
     10. Démarrage
    ========================================================================== */
 'use strict';
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.4.0';
 const SCHEMA_VERSION = 4;
 const STORAGE_KEY = 'coachCourse';
 
@@ -457,16 +457,9 @@ const Data = {
     const p = Data.state.profile;
     // La course cible choisie dans « Nouveau plan » redevient automatique si elle est passée ou supprimée
     if(p.targetRaceId){ const tr = Data.state.races.find(r => r.id===p.targetRaceId); if(!tr || tr.date < Util.iso(Util.today())) p.targetRaceId = null; }
-    const A = Plan.raceA();
-    if(!A){ p.planRaceId = null; if(!p.planStart) p.planStart = Util.iso(Util.monday(Util.today())); return; }
-    if(p.planRaceId !== A.id || !p.planStart){
-      p.planRaceId = A.id;
-      // Départ = lundi courant, ou lundi après 2 semaines de récupération de la course A précédente
-      const prevA = Data.state.races.filter(r => r.priority==='A' && r.date < A.date && Util.parse(r.date) < Util.today()).sort((a,b)=>b.date<a.date?-1:1)[0];
-      let start = Util.monday(Util.today());
-      if(prevA){ const after = Util.monday(Util.addDays(Util.parse(prevA.date), 15)); if(after > start) start = after; }
-      p.planStart = Util.iso(start);
-    }
+    // v1.4 : le départ de saison reste fixe — les blocs s'enchaînent d'eux-mêmes de course en course (Plan.season)
+    if(!p.planStart) p.planStart = Util.iso(Util.monday(Util.today()));
+    const A = Plan.raceA(); p.planRaceId = A ? A.id : null;
   },
 
   exportJSON(){
@@ -785,32 +778,61 @@ const Plan = {
     const tid = Data.state.profile.targetRaceId;
     if(tid){ const tr = Data.state.races.find(r => r.id===tid && r.date >= t); if(tr) return tr; }
     const up = Data.state.races.filter(r => r.date >= t).sort((a,b)=>a.date<b.date?-1:1);
-    return up.find(r => r.priority==='A') || up[0] || null; },
+    return up.find(r => r.priority==='A' || r.priority==='B') || up[0] || null; },
   racesInWeek(monday){ const a = Util.iso(monday), b = Util.iso(Util.addDays(monday,6)); return Data.state.races.filter(r => r.date>=a && r.date<=b); },
 
-  /* Contexte global du plan vers la course A */
-  context(){ const p = Data.state.profile; const race = Plan.raceA(); const planStart = Util.parse(p.planStart || Util.iso(Util.monday(Util.today())));
-    if(!race) return { race:null, planStart, N:0, taper:0, base:0, dev:0, build:0, raceIdx:-1 };
-    const raceIdx = Math.round(Util.daysBetween(planStart, Util.monday(Util.parse(race.date)))/7);
-    const N = raceIdx+1; const taper = race.distanceKm>=40 ? 3 : race.distanceKm>=20 ? (N>=5 ? 2 : 1) : (N>=8 ? 2 : 1);
-    const build = Math.max(0, N - taper); let base=0, dev=0;
-    if(build > 8){ base = Math.round(build*0.4); dev = Math.round(build*0.3); } else if(build > 4){ dev = Math.floor(build/3); }
-    return { race, planStart, N, taper, base, dev, build, raceIdx }; },
+  /* ---- Saison (v1.4) : chaque course A ou B devient un bloc enchaîné.
+     base → développement → spécifique → affûtage → course → récupération → bloc suivant.
+     Les courses C restent des courses « de passage » gérées dans la semaine. ---- */
+  season(){ const p = Data.state.profile; const start = Util.monday(Util.parse(p.planStart || Util.iso(Util.monday(Util.today()))));
+    const targets = Data.state.races.filter(r => (r.priority==='A' || r.priority==='B') && Util.parse(r.date) >= start).sort((a,b)=>a.date<b.date?-1:1);
+    const segs = []; let cursor = 0;
+    for(const r of targets){ const rw = Math.round(Util.daysBetween(start, Util.monday(Util.parse(r.date)))/7);
+      const prev = segs[segs.length-1];
+      if(prev && rw <= prev.raceIdx) continue; // même semaine qu'une autre course cible : gérée comme course dans la semaine
+      const sIdx = prev ? Math.min(cursor, rw) : 0; const N = rw - sIdx + 1;
+      let taper = r.distanceKm>=40 ? 3 : r.distanceKm>=20 ? (N>=5 ? 2 : 1) : (N>=8 ? 2 : 1); taper = Math.min(taper, Math.max(0, N-1));
+      const build = Math.max(0, N - taper); let base=0, dev=0;
+      if(build > 8){ base = Math.round(build*0.4); dev = Math.round(build*0.3); } else if(build > 4){ dev = Math.floor(build/3); }
+      const recov = r.distanceKm>=40 ? 2 : 1; // semaines de récupération après la course, avant le bloc suivant
+      segs.push({ race:r, startIdx:sIdx, raceIdx:rw, N, taper, base, dev, build, recov });
+      cursor = rw + 1 + recov; }
+    return { start, segs }; },
+
+  /* Contexte d'une semaine : dans quel bloc elle tombe, sa phase, et le bloc qui suit */
+  contextAt(monday){ const se = Plan.season(); const idx = Math.round(Util.daysBetween(se.start, monday)/7);
+    let seg = null, after = null, next = null;
+    for(let i=0;i<se.segs.length;i++){ const s = se.segs[i];
+      if(idx >= s.startIdx && idx <= s.raceIdx){ seg = s; after = se.segs[i+1] || null; break; }
+      if(idx < s.startIdx){ next = s; break; } }
+    if(seg){ const rel = idx - seg.startIdx; const c = { race:seg.race, N:seg.N, taper:seg.taper, base:seg.base, dev:seg.dev, build:seg.build, raceIdx:seg.N-1 };
+      return { season:se, idx, rel, race:seg.race, c, phase:Plan.phaseOf(rel, c), next:after, inGap:false }; }
+    if(next){ // entre deux blocs (récupération post-course) : on affiche déjà la prochaine course
+      const c = { race:next.race, N:next.N, taper:next.taper, base:next.base, dev:next.dev, build:next.build, raceIdx:next.N-1 };
+      return { season:se, idx, rel: idx - next.startIdx, race:next.race, c, phase:'recuperation', next:null, inGap:true }; }
+    const last = se.segs[se.segs.length-1];
+    return { season:se, idx, rel:0, race:null, c:{ race:null, N:0, taper:0, base:0, dev:0, build:0, raceIdx:-1 },
+      phase: last && idx <= last.raceIdx + last.recov ? 'recuperation' : 'base', next:null, inGap:false }; },
+  context(){ return Plan.contextAt(Util.monday(Util.today())).c; },
   phaseOf(idx, c){ if(!c.race) return 'base'; if(idx < 0) return 'recuperation'; if(idx > c.raceIdx) return 'recuperation';
     if(idx < c.base) return 'base'; if(idx < c.base + c.dev) return 'developpement'; if(idx < c.build) return 'specifique'; return 'affutage'; },
   phaseName:{ base:'Base', developpement:'Développement', specifique:'Spécifique', affutage:'Affûtage', recuperation:'Récupération' },
   phaseClass:{ base:'ph-base', developpement:'ph-dev', specifique:'ph-spec', affutage:'ph-taper', recuperation:'ph-recup' },
 
-  weekInfo(monday){ const c = Plan.context(); const p = Data.state.profile;
-    const idx = Math.round(Util.daysBetween(c.planStart, monday)/7); const phase = Plan.phaseOf(idx, c);
-    const buildPhase = ['base','developpement','specifique'].includes(phase);
-    const recovery = buildPhase && idx%4===3;
-    let grow = 0; for(let i=0;i<idx;i++){ const ph = Plan.phaseOf(i,c); if(['base','developpement','specifique'].includes(ph) && i%4!==3) grow++; }
-    let vol = Math.min(p.maxVolume, p.weeklyVolume * Math.pow(1.07, grow));
+  weekInfo(monday){ const p = Data.state.profile; const ctx = Plan.contextAt(monday);
+    const phase = ctx.phase; const buildPhase = ['base','developpement','specifique'].includes(phase);
+    const recovery = buildPhase && ctx.rel >= 0 && ctx.rel % 4 === 3;
+    // Croissance du volume : comptée sur toute la saison, à travers les blocs
+    let grow = 0; const lim = Math.min(ctx.idx, 120);
+    for(let i=0;i<lim;i++){ const c2 = Plan.contextAt(Util.addDays(ctx.season.start, i*7));
+      if(['base','developpement','specifique'].includes(c2.phase) && !(c2.rel >= 0 && c2.rel % 4 === 3)) grow++; }
+    let vol = Math.min(p.maxVolume, p.weeklyVolume * Math.pow(1.07, Math.min(grow, 14)));
     if(recovery) vol *= 0.75;
-    if(phase==='affutage'){ const fromEnd = c.raceIdx - idx; vol = vol * (fromEnd===0 ? 0.45 : fromEnd===1 ? 0.7 : 0.85); }
+    if(phase==='affutage'){ const fromEnd = ctx.c.raceIdx - ctx.rel; vol = vol * (fromEnd===0 ? 0.45 : fromEnd===1 ? 0.7 : 0.85); }
     if(phase==='recuperation') vol = p.weeklyVolume*0.5;
-    return { idx, phase, recovery, volume:Math.round(vol), isRaceWeek: c.race && idx===c.raceIdx, race:c.race, c }; },
+    return { idx:ctx.idx, rel:ctx.rel, phase, recovery, volume:Math.round(vol),
+      isRaceWeek: !!ctx.race && !ctx.inGap && ctx.rel===ctx.c.raceIdx, race:ctx.race, c:ctx.c,
+      nextRace: ctx.next ? ctx.next.race : null, inGap:ctx.inGap }; },
 
   zonesCtx(race){ const z = Physio.zones(); if(race){ const goal = race.goalTime || (race.type==='trail' ? Physio.predictTrail(z.vdot, race.distanceKm, race.elevation) : Physio.predict(z.vdot, race.distanceKm*1000)); z.AC = goal/race.distanceKm; if(race.type==='trail') z.AC = Math.min(z.AC, z.M[0]); } else z.AC = z.M[0]; return z; },
 
@@ -828,7 +850,11 @@ const Plan = {
 
     /* --- Sortie longue --- */
     const lp = { base:0.32, developpement:0.33, specifique:(race && race.distanceKm>=40 ? 0.42 : 0.35), affutage:0.3, recuperation:0.3 }[info.phase] + (n<=4 ? 0.05 : 0);
-    const cap = !race ? 22 : race.distanceKm<=10 ? 16 : race.distanceKm<=21.1 ? 22 : race.distanceKm<=42.2 ? 34 : 36;
+    // Double préparation : si une course plus longue suit ce bloc, la sortie longue reste développée pour elle (hors affûtage)
+    const nextR = info.nextRace;
+    const prepNext = !!(nextR && race && ['base','developpement'].includes(info.phase) && nextR.distanceKm > race.distanceKm);
+    const capFor = km => km==null ? 22 : km<=10 ? 16 : km<=21.1 ? 22 : km<=42.2 ? 34 : 36;
+    const cap = Math.max(capFor(race ? race.distanceKm : null), prepNext ? capFor(nextR.distanceKm) : 0);
     let longKm = Util.clamp(Math.round(vol*lp), 8, cap);
     /* --- Séances de qualité --- */
     let qIdx = n>=7 ? [1,4] : n===6 ? [1,3] : n===5 ? [1,2] : n===4 ? [0,1] : [0];
@@ -849,7 +875,7 @@ const Plan = {
 
     /* --- Placement --- */
     const longDay = availDays[n-1];
-    if(!info.isRaceWeek && longDay && mode!=='rouge'){ longDay.run = Lib.longue(mode==='jaune'||mode==='fatigue' ? Math.round(longKm*0.85) : longKm, idx, z, { race, phase:info.phase }); if(mode==='jaune'){ longDay.run = Lib.endurance(Math.round(longKm*0.8), idx, z); longDay.run.title = 'Sortie longue allégée'; longDay.run.kind='L'; } }
+    if(!info.isRaceWeek && longDay && mode!=='rouge'){ longDay.run = Lib.longue(mode==='jaune'||mode==='fatigue' ? Math.round(longKm*0.85) : longKm, idx, z, { race: prepNext ? nextR : race, phase:info.phase }); if(mode==='jaune'){ longDay.run = Lib.endurance(Math.round(longKm*0.8), idx, z); longDay.run.title = 'Sortie longue allégée'; longDay.run.kind='L'; } }
     const nE = Math.max(0, n - qTypes.length - 1); const budget = Math.max(8, (vol - longKm - nE*5) / Math.max(1, qTypes.length));
     let qKm = 0; qTypes.forEach((t,k) => { const d = availDays[qIdx[k]]; if(d && d!==longDay){ d.run = Lib.fit(gen(t, idx*2 + k), budget, z); qKm += d.run.km; } });
     if(info.isRaceWeek && race){ // semaine de course A : déverrouillage la veille, rappel de vitesse 3–4 jours avant, repos après
@@ -1061,7 +1087,7 @@ const UI = {
   extraRow(d){ if(!d.extra) return ''; const x = Strength.extras[d.extra]; return `<div class="sess" style="opacity:.8"><i class="sw S"></i><div class="t"><b>${x.title}</b><span>${x.items.join(' · ')}</span></div></div>`; },
 
   /* ================= Écran Aujourd'hui ================= */
-  home(){ const today = Util.iso(Util.today()); const { week, day } = Plan.forDate(today); const s = day.run; const z = week.z; const race = Plan.raceA(); const p = Data.state.profile;
+  home(){ const today = Util.iso(Util.today()); const { week, day } = Plan.forDate(today); const s = day.run; const z = week.z; const race = week.info.race || Plan.raceA(); const p = Data.state.profile;
     const km = Stats.km(Stats.between(Util.iso(week.monday), Util.iso(Util.addDays(week.monday,6))));
     const done = week.days.filter(d => d.statusRun==='done').length; const planned = week.days.filter(d => d.run && d.run.kind!=='X').length;
     let raceHtml = '';
@@ -1087,7 +1113,7 @@ const UI = {
         <button class="btn sm" style="margin-top:12px" onclick="UI.go('plan')">Voir la semaine</button></div>
       <div class="section-title"><h2>Dernières séances</h2><button class="small" style="color:var(--accent);font-weight:600" onclick="UI.go('journal')">Journal</button></div>
       <div class="card list">${recent.length ? recent.map(UI.actRow).join('') : '<div class="empty">Aucune séance enregistrée. Après ta prochaine sortie, note-la en 30 secondes.</div>'}</div>`; },
-  phaseLine(info){ const c = info.c; if(!c.race) return ''; const segs = []; for(let i=0;i<=c.raceIdx;i++) segs.push(Plan.phaseOf(i,c)); const idx = info.idx;
+  phaseLine(info){ const c = info.c; if(!c.race) return ''; const segs = []; for(let i=0;i<=c.raceIdx;i++) segs.push(Plan.phaseOf(i,c)); const idx = info.rel;
     return `<div class="phaseline">${segs.map((ph,i)=>`<i class="${Plan.phaseClass[ph]} ${i===idx?'cur':''}" style="flex:1"></i>`).join('')}</div>`; },
   actRow(a){ const t = Stats.typeName[a.type]||a.type; const pace = a.distance && a.duration ? Util.fmtPace(a.duration/a.distance)+'/km' : '';
     return `<button class="item" style="width:100%;text-align:left" onclick="UI.openLog('${a.id}')"><i class="sw ${({intervalles:'I',seuil:'T',tempo:'M',cotes:'C',trail:'C',renfo:'S',course:'M'})[a.type]||'E'}" style="width:6px;height:36px;border-radius:3px;background:var(--z${({intervalles:'I',seuil:'T',tempo:'M',cotes:'C',trail:'C',renfo:'S',course:'M'})[a.type]||'E'})"></i><div class="t"><b>${Util.esc(t)}${a.notes?` · <span class="muted" style="font-weight:400">${Util.esc(a.notes.slice(0,40))}</span>`:''}</b><span>${Util.fmtDate(a.date)}${a.feel?` · ressenti ${a.feel}/10`:''}${a.pain?` · douleur ${a.pain}/10`:''}</span></div><div class="r num">${a.distance?`<b>${Util.km(a.distance)} km</b><br>`:''}<span class="muted small">${a.duration?Util.fmtTime(a.duration):''}${pace?' · '+pace:''}</span></div></button>`; },
@@ -1096,15 +1122,27 @@ const UI = {
   plan(){ const monday = Util.addDays(Util.monday(Util.today()), UI.weekOffset*7); const w = Plan.build(monday); const info = w.info; const today = Util.iso(Util.today());
     const z = w.z; const zonesHtml = ['E','M','T','I'].map(k => `<span class="small"><span class="pill z ${k}">${k}</span> ${Physio.zoneLabel(z,k)}</span>`).join('<br>');
     return `
-      <div class="weeknav"><button class="iconbtn" onclick="UI.weekOffset--;UI.render()" aria-label="Semaine précédente">‹</button><div class="title"><b>${UI.weekOffset===0?'Cette semaine':UI.weekOffset===1?'Semaine prochaine':UI.weekOffset===-1?'Semaine dernière':'Semaine '+(info.idx+1)}</b><span>${Util.weekLabel(monday)}</span></div><button class="iconbtn" onclick="UI.weekOffset++;UI.render()" aria-label="Semaine suivante">›</button></div>
+      <div class="weeknav"><button class="iconbtn" onclick="UI.weekOffset--;UI.render()" aria-label="Semaine précédente">‹</button><div class="title"><b>${UI.weekOffset===0?'Cette semaine':UI.weekOffset===1?'Semaine prochaine':UI.weekOffset===-1?'Semaine dernière':(info.race && info.rel>=0 ? 'Semaine '+(info.rel+1)+' du bloc' : 'Récupération')}</b><span>${Util.weekLabel(monday)}</span></div><button class="iconbtn" onclick="UI.weekOffset++;UI.render()" aria-label="Semaine suivante">›</button></div>
       <div class="card"><div class="row between"><div><span class="pill">${Plan.phaseName[info.phase]}${info.recovery?' · allégée':''}${info.isRaceWeek?' · semaine de course':''}</span></div><div class="num"><b>${Util.km(w.totalKm)} km</b> <span class="muted small">prévus</span></div></div>
         ${UI.phaseLine(info)}
-        ${info.race ? `<div class="small muted">Vers ${Util.esc(info.race.name)} · semaine ${info.idx+1} de ${info.c.N}</div>`:'<div class="small muted">Aucune course à venir : crée un nouveau plan pour générer un entraînement ciblé.</div>'}
+        ${info.race ? `<div class="small muted">${info.inGap ? `Récupération post-course · prochain bloc : ${Util.esc(info.race.name)}` : `Vers ${Util.esc(info.race.name)} · semaine ${info.rel+1} de ${info.c.N}`}${info.nextRace ? ` · ensuite : ${Util.esc(info.nextRace.name)}` : ''}</div>`:'<div class="small muted">Aucune course à venir : crée un nouveau plan pour générer un entraînement ciblé.</div>'}
         <div class="btnrow" style="margin-top:12px"><button class="btn sm" onclick="UI.openAdjust('${Util.iso(monday)}')">${w.mode?'Ajustement : '+({skipped:'séance sautée',jaune:'feu jaune',rouge:'feu rouge',fatigue:'fatigue',voyage:'voyage'})[w.mode]:'Ajuster la semaine'}</button><button class="btn sm ${info.race?'':'primary'}" onclick="UI.openNewPlan()">Nouveau plan</button>${UI.weekOffset!==0?`<button class="btn sm" onclick="UI.weekOffset=0;UI.render()">Aujourd'hui</button>`:''}</div></div>
+      ${UI.seasonCard()}
       ${w.notices.map(n=>`<div class="notice ${w.mode==='jaune'?'jaune':w.mode==='rouge'?'rouge':''}">${Util.esc(n)}</div>`).join('')}
       <p class="tiny muted" style="margin:-4px 0 8px">Glisse une séance par sa poignée ⋮⋮ sur un autre jour pour les échanger.</p>
       <div class="card" style="padding:6px 16px">${w.days.map(d => `<div class="day ${d.date===today?'today':''}" data-date="${d.date}"><div class="d"><b>${Util.dowShort[d.dow]}</b><span>${Util.parse(d.date).getDate()}</span></div><div class="body">${UI.sessRow(d, d.run, 'run')}${UI.sessRow(d, d.strength, 'renfo')}${UI.extraRow(d)}</div></div>`).join('')}</div>
       <details class="card"><summary>Zones de cette semaine (VDOT ${z.vdot})</summary><div class="body" style="line-height:1.9">${zonesHtml}<br><span class="small"><span class="pill z M">AC</span> allure course cible ${Util.fmtPace(z.AC)}/km</span></div></details>`; },
+
+  /* Carte « Ma saison » : la chaîne des blocs, de course en course */
+  seasonCard(){ const se = Plan.season(); if(!se.segs.length) return '';
+    const t = Util.iso(Util.today()); const curIdx = Math.round(Util.daysBetween(se.start, Util.monday(Util.today()))/7);
+    return `<details class="card"><summary>Ma saison · ${se.segs.length} bloc${se.segs.length>1?'s':''} de course</summary><div class="body">
+      ${se.segs.map(s => { const done = s.race.date < t; const cur = !done && curIdx >= s.startIdx && curIdx <= s.raceIdx;
+        const startDate = Util.iso(Util.addDays(se.start, s.startIdx*7));
+        return `<div class="row between" style="padding:8px 0;border-bottom:1px solid var(--line);gap:10px;${done?'opacity:.5':''}">
+          <div style="min-width:0"><b>${Util.esc(s.race.name)}</b><div class="small muted">${Util.fmtDate(s.race.date, true)} · ${s.race.distanceKm} km ${s.race.type==='trail'?'trail':'route'} · priorité ${s.race.priority}</div></div>
+          <div class="small" style="text-align:right;flex:none">${done ? 'Terminé' : cur ? `<b style="color:var(--accent)">Bloc en cours</b><br><span class="muted">${s.N} sem.</span>` : `Bloc de ${s.N} sem.<br><span class="muted">dès le ${Util.fmtDate(startDate)}</span>`}</div></div>`; }).join('')}
+      <p class="tiny muted" style="margin-top:8px">Chaque course A ou B a son bloc : base → développement → spécifique → affûtage → course → récupération, puis le bloc suivant démarre tout seul. Quand une course plus longue suit (ex. marathon après un 10 km), la sortie longue reste développée pour elle pendant le bloc en cours. Les courses C restent des courses de passage, intégrées à leur semaine.</p></div></details>`; },
 
   /* ================= Écran Journal ================= */
   journal(){ const t = Util.today(); const m = Util.monday(t); const wk = Stats.between(Util.iso(m), Util.iso(Util.addDays(m,6)));
@@ -1222,13 +1260,14 @@ Object.assign(UI, {
 
   openRace(id){ const r = id ? Data.state.races.find(x=>x.id===id) : null; const t = Util.iso(Util.today()); const z = Physio.zones();
     if(r){ const past = r.date < t; const pred = r.type==='trail'?Physio.predictTrail(z.vdot,r.distanceKm,r.elevation):Physio.predict(z.vdot,r.distanceKm*1000); const dj = Util.daysBetween(Util.today(), Util.parse(r.date));
-      const c = Plan.context(); const phase = (c.race && c.race.id===r.id) ? Plan.phaseName[Plan.weekInfo(Util.monday(Util.today())).phase] : null;
+      const wi = Plan.weekInfo(Util.monday(Util.today())); const phase = (wi.race && wi.race.id===r.id && !wi.inGap) ? Plan.phaseName[wi.phase] : null;
+      const seg = Plan.season().segs.find(s => s.race.id===r.id); const segLine = seg && !past ? `Bloc d'entraînement de ${seg.N} semaines${phase?'':' · dès le '+Util.fmtDate(Util.iso(Util.addDays(Plan.season().start, seg.startIdx*7)), true)}` : null;
       UI.sheet(`<div class="row between"><span class="pill ${r.priority==='C'?'Cprio':r.priority}">Priorité ${r.priority}</span><span class="small muted">${past?'Passée':dj===0?'Aujourd\'hui':'J-'+dj}</span></div><h2 style="margin-top:8px">${Util.esc(r.name)}</h2>
         <p class="muted">${Util.fmtDateLong(r.date)} ${Util.parse(r.date).getFullYear()} · ${r.distanceKm} km ${r.type==='trail'?'trail · '+(r.elevation||0)+' m D+':'route · '+(r.elevation||0)+' m D+'}${r.location?' · '+Util.esc(r.location):''}</p>
         ${r.notes?`<p class="small" style="margin-top:6px">${Util.esc(r.notes)}</p>`:''}
         <div class="grid2" style="margin:12px 0"><div class="stat"><div class="v num">${r.goalTime?Util.fmtTime(r.goalTime):'—'}</div><div class="l">temps visé</div></div><div class="stat"><div class="v num">${Util.fmtTime(pred)}</div><div class="l">prédit (VDOT ${z.vdot})</div></div></div>
         ${r.goalTime?`<p class="small muted">Allure cible ${Util.fmtPace(r.goalTime/r.distanceKm)}/km${r.type==='route'?` · allure prédite ${Util.fmtPace(pred/r.distanceKm)}/km`:''}. ${r.goalTime<pred*0.97?'Objectif ambitieux par rapport au VDOT : il faudra une prépa propre et une bonne journée.':'Objectif cohérent avec ta forme actuelle.'}</p>`:''}
-        ${phase?`<p class="small" style="margin-top:6px">Course A du plan · phase actuelle : <b>${phase}</b></p>`:''}
+        ${phase?`<p class="small" style="margin-top:6px">Bloc en cours · phase actuelle : <b>${phase}</b></p>`:segLine?`<p class="small muted" style="margin-top:6px">${segLine}</p>`:''}
         ${r.result?`<div class="card flat" style="margin-top:12px"><b>Résultat : ${Util.fmtTime(r.result.time)}</b> · ${Util.fmtPace(r.result.time/r.distanceKm)}/km${r.result.rank?' · '+Util.esc(r.result.rank):''}${r.result.feel?' · ressenti '+r.result.feel+'/10':''}${r.result.learnings?`<p class="small" style="margin-top:6px">${Util.esc(r.result.learnings)}</p>`:''}</div>`:''}
         <div class="btnrow" style="margin-top:12px">${!past?`<button class="btn primary" onclick="UI.openChecklist('${r.id}')">Check-list pré-course</button>`:''}<button class="btn" onclick="UI.openResult('${r.id}')">${r.result?'Modifier le résultat':'Saisir le résultat'}</button></div>
         <div class="btnrow" style="margin-top:8px"><button class="btn sm" onclick="UI.editRace('${r.id}')">Modifier</button><button class="btn sm danger" onclick="UI.deleteRace('${r.id}')">Supprimer</button></div>`); }
